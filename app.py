@@ -135,7 +135,7 @@ def build_app():
             <hr>
             <p style='text-align:center; color: #6b7280; font-size: 0.9em;'>
                 ⚡ Built by <strong>Kenroy Green</strong> · Data Engineer → AI Engineer Transition ·
-                <em>Medu Designs / Green Analytics Ltd</em>
+                <em>Green Analytics Ltd</em>
             </p>
             """
         )
