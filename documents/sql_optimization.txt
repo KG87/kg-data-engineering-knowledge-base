@@ -1,0 +1,553 @@
+# SQL Optimization - Performance Tuning Best Practices
+
+## Overview
+SQL optimization is critical for data engineering performance. Based on 15+ years of experience with SQL Server, PostgreSQL, Redshift, and Databricks, these are battle-tested techniques for writing efficient queries.
+
+## Query Performance Fundamentals
+
+### Execution Plan Analysis
+
+**Key Metrics**
+- Estimated vs Actual Rows: Large differences indicate stale statistics
+- Table Scans: Replace with index seeks when possible
+- Sort operations: Expensive, try to eliminate
+- Hash/Merge joins: Understand join strategies
+- Parallelism: Multi-threaded execution
+
+**SQL Server**
+```sql
+SET STATISTICS IO ON;
+SET STATISTICS TIME ON;
+
+-- Your query here
+SELECT * FROM fct_claims WHERE claim_date > '2024-01-01';
+
+-- Review Messages tab for:
+-- Logical reads, Physical reads, CPU time, Elapsed time
+```
+
+**PostgreSQL**
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM fct_claims WHERE claim_date > '2024-01-01';
+```
+
+### Statistics and Indexes
+
+**Update Statistics** (Critical!)
+```sql
+-- SQL Server
+UPDATE STATISTICS fct_claims WITH FULLSCAN;
+
+-- PostgreSQL
+ANALYZE fct_claims;
+```
+
+**Index Strategy**
+- Clustered index on primary key (one per table)
+- Non-clustered indexes on foreign keys
+- Covering indexes for frequently queried columns
+- Avoid over-indexing (insert/update penalty)
+```sql
+-- Create non-clustered index on frequently filtered column
+CREATE NONCLUSTERED INDEX idx_claims_date 
+ON fct_claims(claim_date)
+INCLUDE (claim_amount, policy_number);
+```
+
+## Common Performance Killers
+
+### 1. SELECT * (Avoid Always)
+
+**Problem**
+- Retrieves unnecessary columns
+- Increases I/O and network transfer
+- Breaks covering index opportunities
+
+**Bad**
+```sql
+SELECT * 
+FROM fct_claims c
+JOIN dim_policies p ON c.policy_key = p.policy_key;
+```
+
+**Good**
+```sql
+SELECT 
+    c.claim_id,
+    c.claim_amount,
+    p.policy_number
+FROM fct_claims c
+JOIN dim_policies p ON c.policy_key = p.policy_key;
+```
+
+### 2. Functions on Indexed Columns
+
+**Problem**
+- Functions prevent index usage
+- Forces table/index scan
+
+**Bad**
+```sql
+-- Cannot use index on claim_date
+SELECT * 
+FROM fct_claims
+WHERE YEAR(claim_date) = 2024;
+```
+
+**Good**
+```sql
+-- Index on claim_date can be used
+SELECT * 
+FROM fct_claims
+WHERE claim_date >= '2024-01-01' 
+  AND claim_date < '2025-01-01';
+```
+
+### 3. Implicit Conversions
+
+**Problem**
+- Data type mismatches force conversions
+- Prevents index usage
+
+**Bad**
+```sql
+-- claim_id is VARCHAR, but comparing to INT
+SELECT * 
+FROM fct_claims
+WHERE claim_id = 12345;
+```
+
+**Good**
+```sql
+-- Explicit string comparison
+SELECT * 
+FROM fct_claims
+WHERE claim_id = '12345';
+```
+
+### 4. OR Conditions
+
+**Problem**
+- OR often prevents index usage
+- Better to split into UNION
+
+**Bad**
+```sql
+SELECT * 
+FROM fct_claims
+WHERE claim_status = 'Open' 
+   OR claim_amount > 100000;
+```
+
+**Good**
+```sql
+SELECT * FROM fct_claims WHERE claim_status = 'Open'
+UNION
+SELECT * FROM fct_claims WHERE claim_amount > 100000;
+```
+
+### 5. Correlated Subqueries
+
+**Problem**
+- Executes once per outer row
+- Extremely slow on large datasets
+
+**Bad**
+```sql
+SELECT 
+    u.underwriter_name,
+    (SELECT COUNT(*) 
+     FROM fct_claims c 
+     WHERE c.underwriter_key = u.underwriter_key) as claim_count
+FROM dim_underwriters u;
+```
+
+**Good**
+```sql
+SELECT 
+    u.underwriter_name,
+    COUNT(c.claim_id) as claim_count
+FROM dim_underwriters u
+LEFT JOIN fct_claims c ON u.underwriter_key = c.underwriter_key
+GROUP BY u.underwriter_name;
+```
+
+## Advanced Optimization Techniques
+
+### Window Functions (Modern SQL)
+
+**Running Totals**
+```sql
+-- Efficient running total without self-join
+SELECT 
+    claim_date,
+    claim_amount,
+    SUM(claim_amount) OVER (
+        ORDER BY claim_date
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) as running_total
+FROM fct_claims;
+```
+
+**Ranking**
+```sql
+-- Top 3 claims per underwriter
+WITH ranked_claims AS (
+    SELECT 
+        underwriter_key,
+        claim_id,
+        claim_amount,
+        ROW_NUMBER() OVER (
+            PARTITION BY underwriter_key 
+            ORDER BY claim_amount DESC
+        ) as rank
+    FROM fct_claims
+)
+SELECT * FROM ranked_claims WHERE rank <= 3;
+```
+
+### Common Table Expressions (CTEs)
+
+**Benefits**
+- Improved readability
+- Recursive queries
+- Easier debugging
+
+**Example from Aspen Insurance**
+```sql
+WITH claims_by_underwriter AS (
+    SELECT 
+        underwriter_key,
+        COUNT(*) as claim_count,
+        SUM(claim_amount) as total_amount
+    FROM fct_claims
+    WHERE claim_date >= '2024-01-01'
+    GROUP BY underwriter_key
+),
+underwriter_performance AS (
+    SELECT 
+        u.underwriter_name,
+        cbu.claim_count,
+        cbu.total_amount,
+        cbu.total_amount / cbu.claim_count as avg_claim
+    FROM claims_by_underwriter cbu
+    JOIN dim_underwriters u ON cbu.underwriter_key = u.underwriter_key
+)
+SELECT * 
+FROM underwriter_performance
+WHERE avg_claim > 50000
+ORDER BY total_amount DESC;
+```
+
+### Temp Tables vs Table Variables
+
+**Temp Tables** (Preferred for large datasets)
+```sql
+-- Creates statistics, can be indexed
+CREATE TABLE #temp_claims (
+    claim_id VARCHAR(50),
+    claim_amount DECIMAL(18,2)
+);
+
+INSERT INTO #temp_claims
+SELECT claim_id, claim_amount
+FROM fct_claims
+WHERE claim_date >= '2024-01-01';
+
+CREATE INDEX idx_temp_claims ON #temp_claims(claim_id);
+
+-- Use #temp_claims in subsequent queries
+```
+
+**Table Variables** (Small datasets < 100 rows)
+```sql
+DECLARE @claim_ids TABLE (claim_id VARCHAR(50));
+
+INSERT INTO @claim_ids VALUES ('CLM001'), ('CLM002');
+
+SELECT c.*
+FROM fct_claims c
+WHERE c.claim_id IN (SELECT claim_id FROM @claim_ids);
+```
+
+## Join Optimization
+
+### Join Order Matters
+
+**Small to Large**
+```sql
+-- Join smallest table first
+SELECT c.*
+FROM dim_underwriters u          -- 100 rows
+JOIN fct_policies p              -- 10,000 rows
+    ON u.underwriter_key = p.underwriter_key
+JOIN fct_claims c                -- 1,000,000 rows
+    ON p.policy_key = c.policy_key
+WHERE u.department = 'Marine';
+```
+
+### EXISTS vs IN
+
+**EXISTS** (Better for large datasets)
+```sql
+-- Stops at first match
+SELECT *
+FROM dim_policies p
+WHERE EXISTS (
+    SELECT 1 
+    FROM fct_claims c 
+    WHERE c.policy_key = p.policy_key
+);
+```
+
+**IN** (Better for small, static lists)
+```sql
+SELECT *
+FROM fct_claims
+WHERE claim_status IN ('Open', 'Pending', 'Review');
+```
+
+### Join Hints (Use Sparingly)
+```sql
+-- Force hash join for large datasets
+SELECT c.*, p.*
+FROM fct_claims c
+INNER HASH JOIN dim_policies p 
+    ON c.policy_key = p.policy_key;
+```
+
+## Partitioning Strategies
+
+### Range Partitioning (Most Common)
+
+**SQL Server**
+```sql
+-- Create partition function
+CREATE PARTITION FUNCTION pf_claim_date (DATE)
+AS RANGE RIGHT FOR VALUES 
+    ('2022-01-01', '2023-01-01', '2024-01-01', '2025-01-01');
+
+-- Create partition scheme
+CREATE PARTITION SCHEME ps_claim_date
+AS PARTITION pf_claim_date
+TO (fg_2021, fg_2022, fg_2023, fg_2024, fg_2025);
+
+-- Create partitioned table
+CREATE TABLE fct_claims_partitioned (
+    claim_id VARCHAR(50),
+    claim_date DATE,
+    claim_amount DECIMAL(18,2)
+) ON ps_claim_date(claim_date);
+```
+
+**Benefits**
+- Partition elimination (scan only relevant partitions)
+- Parallel query execution
+- Easier maintenance (drop old partitions)
+- Faster loads (switch partitions)
+
+### Partition Pruning
+```sql
+-- Only scans 2024 partition
+SELECT *
+FROM fct_claims_partitioned
+WHERE claim_date BETWEEN '2024-01-01' AND '2024-12-31';
+```
+
+## Aggregation Optimization
+
+### Pre-Aggregation
+
+**Create aggregate tables**
+```sql
+-- Daily aggregation (instead of querying millions of rows)
+CREATE TABLE agg_daily_claims AS
+SELECT 
+    claim_date,
+    underwriter_key,
+    COUNT(*) as claim_count,
+    SUM(claim_amount) as total_amount,
+    AVG(claim_amount) as avg_amount
+FROM fct_claims
+GROUP BY claim_date, underwriter_key;
+
+-- Query aggregate instead of fact
+SELECT * 
+FROM agg_daily_claims
+WHERE claim_date >= '2024-01-01';
+```
+
+### Materialized Views
+
+**PostgreSQL**
+```sql
+CREATE MATERIALIZED VIEW mv_monthly_claims AS
+SELECT 
+    DATE_TRUNC('month', claim_date) as claim_month,
+    underwriter_key,
+    COUNT(*) as claim_count,
+    SUM(claim_amount) as total_amount
+FROM fct_claims
+GROUP BY DATE_TRUNC('month', claim_date), underwriter_key;
+
+-- Refresh periodically
+REFRESH MATERIALIZED VIEW mv_monthly_claims;
+```
+
+## Data Type Optimization
+
+### Use Appropriate Types
+
+**Bad**
+```sql
+-- Wasting space
+claim_amount DECIMAL(38,10)  -- Only need (18,2)
+claim_status VARCHAR(255)     -- Max length is 20 chars
+```
+
+**Good**
+```sql
+-- Right-sized
+claim_amount DECIMAL(18,2)
+claim_status VARCHAR(20)
+```
+
+### Fixed-Length vs Variable-Length
+
+**CHAR** (Fixed-length, faster)
+```sql
+-- Use for fixed-length codes
+country_code CHAR(2)
+currency_code CHAR(3)
+```
+
+**VARCHAR** (Variable-length, space-efficient)
+```sql
+-- Use for variable content
+underwriter_name VARCHAR(200)
+```
+
+## Batch Processing Optimization
+
+### Bulk Insert
+```sql
+-- Much faster than row-by-row
+INSERT INTO fct_claims (claim_id, claim_amount)
+SELECT claim_id, claim_amount
+FROM staging.claims_load;
+
+-- Not: 
+-- INSERT INTO fct_claims VALUES ('CLM001', 1000);
+-- INSERT INTO fct_claims VALUES ('CLM002', 2000);
+-- (repeat 1 million times)
+```
+
+### Batch Updates
+```sql
+-- Update in batches to avoid long-running transactions
+WHILE EXISTS (SELECT 1 FROM claims_to_update WHERE processed = 0)
+BEGIN
+    UPDATE TOP (1000) fct_claims
+    SET claim_status = 'Closed'
+    FROM fct_claims c
+    JOIN claims_to_update u ON c.claim_id = u.claim_id
+    WHERE u.processed = 0;
+    
+    UPDATE claims_to_update SET processed = 1
+    WHERE claim_id IN (
+        SELECT TOP 1000 claim_id 
+        FROM claims_to_update 
+        WHERE processed = 0
+    );
+END
+```
+
+## Real-World Optimization: Wilcomatic
+
+**Challenge**
+- Revenue dashboard taking 5+ minutes to load
+- Querying 10M+ transaction rows
+
+**Solution**
+```sql
+-- Created daily aggregate
+CREATE TABLE agg_daily_revenue (
+    revenue_date DATE,
+    customer_key INT,
+    product_key INT,
+    total_revenue DECIMAL(18,2),
+    total_transactions INT
+);
+
+-- Rebuilt daily
+TRUNCATE TABLE agg_daily_revenue;
+
+INSERT INTO agg_daily_revenue
+SELECT 
+    CAST(transaction_date AS DATE),
+    customer_key,
+    product_key,
+    SUM(revenue_amount),
+    COUNT(*)
+FROM fct_transactions
+GROUP BY CAST(transaction_date AS DATE), customer_key, product_key;
+```
+
+**Result**
+- Dashboard load time: 5 minutes → 3 seconds
+- 100x performance improvement
+- Power BI now queries 365 rows instead of 10M rows
+
+## Monitoring and Troubleshooting
+
+### Slow Query Log
+
+**Enable query logging**
+```sql
+-- SQL Server: Query Store
+ALTER DATABASE insurance_dw SET QUERY_STORE = ON;
+
+-- PostgreSQL: log slow queries
+ALTER DATABASE insurance_dw 
+SET log_min_duration_statement = 1000;  -- Log queries > 1 second
+```
+
+### Blocking and Deadlocks
+
+**Identify blocking**
+```sql
+-- SQL Server
+SELECT 
+    blocked.session_id,
+    blocked.wait_type,
+    blocking.session_id as blocking_session
+FROM sys.dm_exec_requests blocked
+LEFT JOIN sys.dm_exec_requests blocking 
+    ON blocked.blocking_session_id = blocking.session_id
+WHERE blocked.blocking_session_id > 0;
+```
+
+## Best Practices Summary
+
+1. **Always use WHERE clauses** to filter data early
+2. **Avoid SELECT *** - specify only needed columns
+3. **Index foreign keys** in fact tables
+4. **Update statistics** regularly (weekly for large tables)
+5. **Partition large tables** by date for better performance
+6. **Use CTEs** for complex queries (readability + performance)
+7. **Pre-aggregate** frequently queried metrics
+8. **Batch large operations** (1000-10000 rows at a time)
+9. **Monitor execution plans** and optimize slow queries
+10. **Right-size data types** to save space and improve speed
+
+## Key Takeaways
+
+- Execution plans are your best friend for optimization
+- Small changes (removing SELECT *, adding indexes) yield big gains
+- Partitioning is essential for tables > 10M rows
+- Pre-aggregation dramatically improves dashboard performance
+- Window functions replace complex self-joins
+- Always test with production-size datasets
+- Monitor query performance continuously
+

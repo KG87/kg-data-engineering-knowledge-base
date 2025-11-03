@@ -1,0 +1,433 @@
+# Data Modeling - Kimball & Medallion Architecture
+
+## Overview
+Data modeling is the foundation of any analytics platform. This document covers both traditional Kimball dimensional modeling and modern Medallion architecture, based on 15+ years of experience building data warehouses.
+
+## Kimball Dimensional Modeling
+
+### Core Concepts
+
+**Fact Tables**
+- Contain measurements, metrics, or facts about business processes
+- Grain: The level of detail (e.g., one row per claim, one row per transaction)
+- Foreign keys to dimension tables
+- Numeric measures (amounts, quantities, counts)
+- Immutable once written (append-only)
+
+**Dimension Tables**
+- Contain descriptive attributes about business entities
+- Surrogate keys (not natural keys)
+- Slowly changing dimensions (SCD) for historical tracking
+- Denormalized for query performance
+- Support filtering, grouping, and labeling in reports
+
+### Star Schema Design
+
+**Benefits**
+- Simple structure easy for business users to understand
+- Optimized for query performance
+- Minimal joins required
+- Supports BI tool aggregations
+
+**Structure**
+```
+        dim_underwriters
+                |
+dim_brokers --- fct_policies --- dim_products
+                |
+        dim_dates
+```
+
+### Real-World Example: Insurance Claims Warehouse
+
+**Fact Table: fct_claims**
+```sql
+CREATE TABLE fct_claims (
+    claim_key BIGINT PRIMARY KEY,           -- Surrogate key
+    claim_id VARCHAR(50),                    -- Natural key
+    policy_key BIGINT,                       -- FK to dim_policies
+    underwriter_key BIGINT,                  -- FK to dim_underwriters
+    broker_key BIGINT,                       -- FK to dim_brokers
+    claim_date_key INT,                      -- FK to dim_dates
+    loss_date_key INT,                       -- FK to dim_dates
+    
+    -- Measures
+    claim_amount DECIMAL(18,2),
+    reserve_amount DECIMAL(18,2),
+    paid_amount DECIMAL(18,2),
+    outstanding_amount DECIMAL(18,2),
+    
+    -- Audit columns
+    loaded_at TIMESTAMP,
+    updated_at TIMESTAMP
+);
+```
+
+**Dimension Table: dim_underwriters**
+```sql
+CREATE TABLE dim_underwriters (
+    underwriter_key BIGINT PRIMARY KEY,      -- Surrogate key
+    underwriter_id VARCHAR(50),              -- Natural key
+    underwriter_name VARCHAR(200),
+    department VARCHAR(100),
+    region VARCHAR(100),
+    
+    -- SCD Type 2 columns
+    effective_date DATE,
+    expiry_date DATE,
+    is_current BOOLEAN,
+    
+    -- Audit columns
+    loaded_at TIMESTAMP
+);
+```
+
+**Dimension Table: dim_dates**
+```sql
+CREATE TABLE dim_dates (
+    date_key INT PRIMARY KEY,                -- YYYYMMDD format
+    full_date DATE,
+    day_of_week VARCHAR(20),
+    day_of_month INT,
+    day_of_year INT,
+    week_of_year INT,
+    month_number INT,
+    month_name VARCHAR(20),
+    quarter INT,
+    year INT,
+    is_weekend BOOLEAN,
+    is_holiday BOOLEAN,
+    fiscal_year INT,
+    fiscal_quarter INT
+);
+```
+
+### Slowly Changing Dimensions (SCD)
+
+**Type 1: Overwrite**
+- No history preserved
+- Simple to implement
+- Use when: History not important (e.g., fixing typos)
+
+**Type 2: Add Row** (Most Common)
+- Full history preserved
+- New row for each change
+- Use effective_date, expiry_date, is_current
+- Use when: History critical (e.g., broker assignments)
+```sql
+-- Example: Underwriter changes department
+-- Old row:
+-- underwriter_key=1, effective_date=2020-01-01, expiry_date=2024-12-31, is_current=FALSE
+
+-- New row:
+-- underwriter_key=2, effective_date=2025-01-01, expiry_date=9999-12-31, is_current=TRUE
+```
+
+**Type 3: Add Column**
+- Limited history (previous + current)
+- Use when: Only need to track one change
+
+### Fact Table Types
+
+**Transaction Fact Tables**
+- Most common type
+- One row per business event
+- Grain: Individual transaction/claim/policy
+- Example: fct_claims, fct_policies
+
+**Periodic Snapshot Fact Tables**
+- Predictable time intervals
+- Grain: One row per period (day/month/quarter)
+- Example: fct_monthly_policy_balances
+
+**Accumulating Snapshot Fact Tables**
+- Track lifecycle of a process
+- Multiple date columns (start_date, approval_date, close_date)
+- Row updates as process progresses
+- Example: fct_claim_lifecycle
+
+### Conformed Dimensions
+
+**Purpose**
+- Shared across multiple fact tables
+- Enable drill-across analysis
+- Consistent definitions across business
+
+**Example**
+- dim_dates used by fct_claims, fct_policies, fct_transactions
+- dim_underwriters used across all insurance processes
+- dim_brokers shared by multiple lines of business
+
+## Medallion Architecture (Bronze/Silver/Gold)
+
+### Bronze Layer (Raw)
+
+**Purpose**
+- Land raw data exactly as received from source
+- Historical archive of all source data
+- Immutable once written
+
+**Characteristics**
+- No transformations applied
+- Original data types preserved
+- Includes technical metadata (load timestamp, source filename)
+- Stored in Delta Lake or Parquet format
+
+**Example Structure**
+```
+bronze/
+├── sharepoint/
+│   ├── claims_list/
+│   │   └── 2025-11-03.parquet
+│   └── policies_list/
+│       └── 2025-11-03.parquet
+├── api/
+│   └── underwriting_system/
+│       └── 2025-11-03.json
+└── databases/
+    └── sql_server/
+        └── customer_data/
+            └── 2025-11-03.parquet
+```
+
+**Implementation (Wilcomatic Experience)**
+```sql
+CREATE TABLE bronze.sharepoint_claims (
+    -- Raw columns as received
+    ClaimID STRING,
+    PolicyNumber STRING,
+    ClaimDate STRING,              -- Not yet typed
+    ClaimAmount STRING,            -- Still string from SharePoint
+    
+    -- Metadata
+    _source_filename STRING,
+    _loaded_at TIMESTAMP,
+    _source_modified_at TIMESTAMP
+)
+USING DELTA
+PARTITIONED BY (_loaded_at);
+```
+
+### Silver Layer (Cleaned & Conformed)
+
+**Purpose**
+- Clean, validate, and type data
+- Apply business rules
+- Standardize formats across sources
+- Deduplicate and handle data quality issues
+
+**Characteristics**
+- Consistent naming conventions
+- Proper data types
+- Business rules applied
+- Data quality checks implemented
+- Still atomic (not aggregated)
+
+**Example Structure**
+```
+silver/
+├── claims/              # Cleaned from bronze.sharepoint_claims
+├── policies/            # Cleaned from multiple bronze sources
+├── underwriters/        # Master data, conformed
+└── brokers/            # Reference data, standardized
+```
+
+**Implementation**
+```sql
+CREATE TABLE silver.claims (
+    claim_id STRING,
+    policy_number STRING,
+    claim_date DATE,                    -- Properly typed
+    claim_amount DECIMAL(18,2),         -- Proper numeric type
+    claim_status STRING,
+    
+    -- Business rules applied
+    is_valid_claim BOOLEAN,
+    claim_category STRING,
+    
+    -- Data quality flags
+    data_quality_score INT,
+    has_missing_fields BOOLEAN,
+    
+    -- Lineage
+    source_system STRING,
+    loaded_at TIMESTAMP,
+    processed_at TIMESTAMP
+)
+USING DELTA;
+```
+
+### Gold Layer (Business-Ready)
+
+**Purpose**
+- Dimensional models for analytics
+- Aggregated metrics and KPIs
+- Optimized for reporting and BI tools
+- Business-friendly naming
+
+**Characteristics**
+- Star schema or denormalized tables
+- Pre-calculated aggregations
+- Performance-optimized (indexes, partitioning)
+- Directly consumed by Power BI, Tableau
+
+**Example Structure**
+```
+gold/
+├── dimensions/
+│   ├── dim_claims/
+│   ├── dim_policies/
+│   ├── dim_underwriters/
+│   └── dim_dates/
+├── facts/
+│   ├── fct_claims/
+│   └── fct_policies/
+└── aggregates/
+    ├── agg_monthly_claims_by_underwriter/
+    └── agg_quarterly_revenue/
+```
+
+**Implementation**
+```sql
+CREATE TABLE gold.fct_claims (
+    claim_key BIGINT,
+    policy_key BIGINT,
+    underwriter_key BIGINT,
+    broker_key BIGINT,
+    claim_date_key INT,
+    
+    -- Measures
+    claim_amount DECIMAL(18,2),
+    paid_amount DECIMAL(18,2),
+    outstanding_amount DECIMAL(18,2),
+    
+    -- Pre-calculated KPIs
+    is_large_claim BOOLEAN,
+    days_to_settlement INT,
+    
+    loaded_at TIMESTAMP
+)
+USING DELTA
+PARTITIONED BY (claim_date_key);
+```
+
+## Combining Kimball & Medallion
+
+**Modern Approach**
+- Bronze: Raw data staging
+- Silver: Normalized, cleaned data
+- Gold: Kimball star schema (dimensions + facts)
+
+**Benefits**
+- Separation of concerns (ingestion vs. modeling)
+- Data quality progression
+- Flexibility (multiple Gold schemas from same Silver)
+- Auditability (Bronze serves as immutable archive)
+
+## Design Patterns from Experience
+
+### Pattern 1: Incremental Fact Loading
+```sql
+-- Load only new claims since last run
+INSERT INTO gold.fct_claims
+SELECT 
+    claim_key,
+    policy_key,
+    claim_date_key,
+    claim_amount
+FROM silver.claims
+WHERE claim_date > (
+    SELECT MAX(claim_date) FROM gold.fct_claims
+);
+```
+
+### Pattern 2: SCD Type 2 Updates
+```sql
+-- Close old record
+UPDATE gold.dim_underwriters
+SET expiry_date = CURRENT_DATE - 1,
+    is_current = FALSE
+WHERE underwriter_id = '12345'
+  AND is_current = TRUE;
+
+-- Insert new record
+INSERT INTO gold.dim_underwriters
+VALUES (
+    NEXT_SURROGATE_KEY,
+    '12345',
+    'John Smith',
+    'New Department',
+    CURRENT_DATE,
+    '9999-12-31',
+    TRUE
+);
+```
+
+### Pattern 3: Multi-Source Dimensional Merge
+```sql
+-- Combine broker data from multiple sources
+INSERT INTO gold.dim_brokers
+SELECT DISTINCT
+    ROW_NUMBER() OVER (ORDER BY broker_id) as broker_key,
+    COALESCE(src1.broker_id, src2.broker_id) as broker_id,
+    COALESCE(src1.broker_name, src2.broker_name) as broker_name,
+    COALESCE(src1.region, src2.region) as region
+FROM silver.brokers_system1 src1
+FULL OUTER JOIN silver.brokers_system2 src2
+    ON src1.broker_id = src2.broker_id;
+```
+
+## Data Modeling Best Practices
+
+**Grain Definition**
+- Clearly define fact table grain before building
+- Document grain in data dictionary
+- One grain per fact table
+- Test grain with sample queries
+
+**Dimension Design**
+- Use surrogate keys, not natural keys
+- Denormalize dimensions (avoid snowflaking)
+- Include descriptive attributes
+- Add audit columns (loaded_at, updated_at)
+
+**Naming Conventions**
+- Facts: fct_[business_process]
+- Dimensions: dim_[entity]
+- Aggregates: agg_[grain]_[metric]
+- Consistent prefixes/suffixes
+
+**Performance Considerations**
+- Partition large fact tables (by date)
+- Index dimension tables on surrogate keys
+- Use columnar storage (Parquet, Delta)
+- Pre-aggregate frequently used metrics
+
+## Real-World Application: Wilcomatic PE Buyout
+
+**Challenge**
+- Siloed systems (finance, operations, HR, marketing)
+- No unified reporting for PE due diligence
+- Manual Excel-based KPI tracking
+
+**Solution**
+- Bronze: Raw extracts from ERP, CRM, HR systems
+- Silver: Cleaned, standardized business entities
+- Gold: Board-level KPI dashboard (revenue, costs, margins)
+
+**Outcome**
+- Single source of truth for PE investors
+- Automated monthly board reporting
+- Data lineage for audit trail
+- Enabled business valuation discussions
+
+## Key Takeaways
+
+- Kimball star schema remains gold standard for analytics
+- Medallion architecture provides modern data lake structure
+- Combine both: Bronze/Silver for ELT, Gold for Kimball star
+- SCD Type 2 critical for historical analysis
+- Clear grain definition prevents modeling errors
+- Performance optimization through partitioning and indexing
+- Documentation and naming conventions enable self-service
+

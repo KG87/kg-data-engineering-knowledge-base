@@ -1,0 +1,9 @@
+# Python / env
+venv/
+.env
+__pycache__/
+*.pyc
+
+# OS / editor
+.DS_Store
+.ipynb_checkpoints/

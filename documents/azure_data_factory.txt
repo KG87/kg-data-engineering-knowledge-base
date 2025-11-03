@@ -1,0 +1,129 @@
+# Azure Data Factory - Data Engineering Best Practices
+
+## Overview
+Azure Data Factory (ADF) is a cloud-based ETL and data integration service for orchestrating data movement and transformation at scale.
+
+## Core Concepts from Production Experience
+
+### Pipeline Architecture
+- Parameterized Pipelines: Reusable pipelines with parameters for source systems, destination tables
+- Incremental Loads: Use watermark columns or change tracking to load only new/modified data
+- Error Handling: Implement retry logic, dead letter queues, and alerting
+- Orchestration: Chain multiple pipelines using Execute Pipeline activities
+
+### Data Movement Patterns (Aspen Insurance & Aventum Group Experience)
+
+**Bronze Layer Ingestion**
+- Extract raw data from SharePoint, APIs, databases
+- Store in Azure Data Lake Gen2 in native format (JSON, CSV, Parquet)
+- Preserve source metadata (load timestamp, source filename)
+- Use Copy Activity with wildcard paths for dynamic file ingestion
+
+**Silver Layer Transformation**
+- Cleanse and standardize data formats
+- Apply business rules and data quality checks
+- Implement slowly changing dimensions (SCD Type 2)
+- Use Data Flow activities for complex transformations
+
+**Gold Layer Aggregation**
+- Create business-ready tables and views
+- Build star schema dimensions and facts
+- Implement incremental refresh strategies
+- Optimize for Power BI consumption
+
+### Integration Patterns
+
+**SharePoint Integration**
+- SharePoint Online connector to extract lists and libraries
+- Service principal authentication
+- Map SharePoint columns to structured schema
+- Example: Insurance claims data, policy documents
+
+**API Integration**
+- REST API connector for third-party data sources
+- Pagination handling for large datasets
+- OAuth and API key authentication
+- Rate limiting and retry policies
+
+**Database Sources**
+- SQL Server, PostgreSQL, AWS Redshift connectors
+- Parallel copy for large tables
+- Query partitioning for optimal performance
+- Use staging tables for incremental loads
+
+### Performance Optimization
+
+**Copy Activity Tuning**
+- DIU (Data Integration Units): Scale between 2-256 based on data volume
+- Parallel copies: Set based on source system capacity
+- Staged copy: Use Azure Blob Storage as intermediate staging
+- Compression: Enable to reduce network transfer time
+
+**Data Flow Optimization**
+- Partition data for parallel processing
+- Use broadcast joins for small dimension tables
+- Enable data flow debug for testing
+- Monitor cluster usage and right-size compute
+
+### Monitoring and Troubleshooting
+
+**Built-in Monitoring**
+- Pipeline runs: View status, duration, and errors
+- Activity runs: Drill down into individual activity execution
+- Trigger runs: Monitor scheduled and event-based triggers
+- Integration runtime: Track cluster health and activity
+
+**Common Issues**
+- Timeout errors: Increase activity timeout settings
+- Data skew: Partition data more evenly
+- Memory errors: Increase compute size or optimize transformations
+- Authentication failures: Check service principal permissions
+
+### Security Best Practices
+
+**Credentials Management**
+- Store connection strings in Azure Key Vault
+- Use managed identity where possible
+- Rotate credentials regularly
+- Least privilege access for service principals
+
+### Real-World Use Cases
+
+**Insurance Domain (Aspen Insurance)**
+- Automated ingestion of claims data from SharePoint lists
+- Integration with underwriting systems for policy data
+- Transformation of broker submissions into standardized format
+- Loading into SQL Server dimensional model for MI reporting
+
+**Private Equity (Aventum Group)**
+- Extract policy and claims data from Lloyd's market systems
+- Transform underwriter commission calculations
+- Load into AWS Redshift for analytics
+- Integration with Power BI for board reporting
+
+### Best Practices Summary
+
+1. Build modular, reusable pipelines
+2. Implement comprehensive error handling
+3. Use parameters for flexibility
+4. Document pipeline logic and dependencies
+5. Use CI/CD for deployment (Azure DevOps, GitHub)
+6. Maintain separate environments (Dev, Test, Prod)
+
+### Integration with Modern Stack
+
+**Databricks Integration**
+- Use Databricks notebook activity in ADF
+- Pass parameters from ADF to notebooks
+- Handle cluster creation and termination
+
+**dbt Integration**
+- Trigger dbt runs from ADF pipelines
+- Pass environment variables
+- Handle dbt test failures
+
+**Purview Integration**
+- Enable lineage tracking
+- Auto-register datasets
+- Classify sensitive data
+

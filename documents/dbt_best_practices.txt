@@ -1,0 +1,384 @@
+# dbt Best Practices - Modern Data Transformation
+
+## Overview
+dbt (data build tool) enables analytics engineers to transform data in their warehouse using SQL and software engineering best practices. Based on experience at Aventum Group with dbt, Databricks, and Power BI integration.
+
+## Core Concepts
+
+### Project Structure
+```
+dbt_project/
+├── models/
+│   ├── staging/      # Raw data cleaned and typed
+│   ├── intermediate/ # Business logic transformations
+│   ├── marts/        # Business-ready models
+│   └── metrics/      # Semantic layer definitions
+├── tests/
+├── macros/
+├── seeds/
+└── snapshots/
+```
+
+### Medallion Architecture Integration
+
+**Bronze Layer (Staging Models)**
+- Source: Raw data from Azure Data Factory ingestion
+- Purpose: Type casting, renaming, basic cleaning
+- Naming: stg_[source]__[entity].sql
+- Example: stg_sharepoint__claims.sql, stg_api__policies.sql
+
+**Silver Layer (Intermediate Models)**
+- Source: Staging models
+- Purpose: Business rules, joins, deduplication
+- Naming: int_[entity]__[verb].sql
+- Example: int_claims__joined.sql, int_policies__deduplicated.sql
+
+**Gold Layer (Marts Models)**
+- Source: Intermediate models
+- Purpose: Business-ready dimensional models
+- Naming: fct_[entity].sql, dim_[entity].sql
+- Example: fct_claims.sql, dim_underwriters.sql
+
+## Naming Conventions
+
+**Models**
+- Staging: stg_[source]__[entity]
+- Intermediate: int_[entity]__[verb]
+- Fact tables: fct_[entity]
+- Dimension tables: dim_[entity]
+- All lowercase with underscores
+
+**Columns**
+- Primary keys: [entity]_id
+- Foreign keys: [entity]_id
+- Booleans: is_[condition] or has_[attribute]
+- Timestamps: [event]_at or [event]_date
+- All lowercase with underscores
+
+## Materialization Strategies
+
+**Views** (Default)
+- Use for: Transformations with minimal computation
+- Staging models that are always current
+- Models queried infrequently
+- No storage cost, computed at query time
+
+**Tables**
+- Use for: Expensive transformations
+- Large result sets
+- Frequently queried models
+- Marts layer (dimensional models)
+- Storage cost, but fast query performance
+
+**Incremental**
+- Use for: Fact tables with millions of rows
+- Event/transaction data
+- Time-series data
+- Requires unique key and incremental logic
+- Example: Claims with 5M+ rows, updated daily
+
+**Ephemeral**
+- Use for: CTEs that are reused across models
+- Intermediate logic that doesn't need persistence
+- No table/view created, compiled as CTE
+
+## Real-World Implementation (Aventum Group)
+
+### Staging Layer
+```sql
+-- stg_sharepoint__claims.sql
+with source as (
+    select * from {{ source('sharepoint', 'claims_list') }}
+),
+
+renamed as (
+    select
+        claim_id,
+        policy_number,
+        cast(claim_date as date) as claim_date,
+        cast(claim_amount as decimal(18,2)) as claim_amount,
+        claim_status,
+        loaded_at
+    from source
+)
+
+select * from renamed
+```
+
+### Intermediate Layer
+```sql
+-- int_claims__enriched.sql
+with claims as (
+    select * from {{ ref('stg_sharepoint__claims') }}
+),
+
+policies as (
+    select * from {{ ref('stg_api__policies') }}
+),
+
+joined as (
+    select
+        c.claim_id,
+        c.policy_number,
+        c.claim_date,
+        c.claim_amount,
+        p.underwriter_id,
+        p.line_of_business,
+        p.broker_id
+    from claims c
+    left join policies p 
+        on c.policy_number = p.policy_number
+)
+
+select * from joined
+```
+
+### Marts Layer
+```sql
+-- fct_claims.sql
+{{ config(
+    materialized='incremental',
+    unique_key='claim_id'
+) }}
+
+with enriched_claims as (
+    select * from {{ ref('int_claims__enriched') }}
+)
+
+select
+    claim_id,
+    policy_number,
+    claim_date,
+    claim_amount,
+    underwriter_id,
+    line_of_business,
+    broker_id,
+    current_timestamp() as dbt_updated_at
+from enriched_claims
+
+{% if is_incremental() %}
+    where claim_date > (select max(claim_date) from {{ this }})
+{% endif %}
+```
+
+## Testing Strategy
+
+**Schema Tests** (Built-in)
+```yaml
+# models/staging/schema.yml
+version: 2
+
+models:
+  - name: stg_sharepoint__claims
+    columns:
+      - name: claim_id
+        tests:
+          - unique
+          - not_null
+      - name: claim_amount
+        tests:
+          - not_null
+      - name: claim_status
+        tests:
+          - accepted_values:
+              values: ['Open', 'Closed', 'Pending']
+```
+
+**Custom Tests**
+```sql
+-- tests/assert_claim_amounts_positive.sql
+select *
+from {{ ref('fct_claims') }}
+where claim_amount <= 0
+```
+
+**Data Tests**
+- Uniqueness: Primary keys, natural keys
+- Not null: Critical fields
+- Relationships: Foreign key integrity
+- Accepted values: Status codes, categories
+- Custom business rules: Amount ranges, date logic
+
+## Semantic Layer (dbt Metrics)
+
+**Metrics Definition**
+```yaml
+# models/metrics/claims_metrics.yml
+metrics:
+  - name: total_claim_amount
+    label: Total Claim Amount
+    type: simple
+    sql: claim_amount
+    model: ref('fct_claims')
+
+  - name: avg_claim_amount
+    label: Average Claim Amount
+    type: average
+    sql: claim_amount
+    model: ref('fct_claims')
+
+  - name: claim_count
+    label: Number of Claims
+    type: count
+    model: ref('fct_claims')
+```
+
+**Benefits**
+- Consistent definitions across Power BI dashboards
+- Reusable business logic
+- Version controlled metrics
+- Self-service analytics enablement
+
+## Integration with Azure Stack
+
+**Azure Data Factory Integration**
+- Trigger dbt runs from ADF pipelines
+- Use Azure Container Instance or Azure Batch
+- Pass runtime parameters (date ranges, environment)
+- Monitor dbt logs in Azure Monitor
+
+**Databricks Integration**
+- Install dbt-databricks adapter
+- Run dbt on Databricks SQL warehouse
+- Use Unity Catalog for governance
+- Leverage Delta Lake features (time travel, ACID)
+
+**Power BI Integration**
+- Connect directly to Gold layer tables
+- Use semantic layer metrics in DAX
+- Incremental refresh aligned with dbt runs
+- Document lineage from source to report
+
+## Performance Optimization
+
+**Query Optimization**
+- Use CTEs for readability
+- Avoid SELECT *, specify columns
+- Filter early in CTEs
+- Use appropriate JOIN types
+- Partition large tables
+
+**Incremental Model Tuning**
+- Choose appropriate unique_key
+- Use partition_by for time-series data
+- Test incremental logic thoroughly
+- Monitor for data drift
+
+**Macro Usage**
+- Create reusable transformation logic
+- Centralize business rules
+- Generate repetitive code
+- Example: Date spine, currency conversion
+
+## Documentation
+
+**Model Documentation**
+```yaml
+# models/marts/schema.yml
+models:
+  - name: fct_claims
+    description: "Fact table containing all insurance claims"
+    columns:
+      - name: claim_id
+        description: "Unique identifier for each claim"
+      - name: claim_amount
+        description: "Total amount of the claim in GBP"
+```
+
+**Auto-generated Docs**
+- Run: dbt docs generate
+- Serve: dbt docs serve
+- Include lineage graphs
+- Embed in company wiki
+
+## CI/CD Pipeline
+
+**Development Workflow**
+1. Create feature branch
+2. Develop/test models locally
+3. Run dbt test
+4. Create pull request
+5. Automated CI runs tests
+6. Merge to main
+7. Automated CD deploys to prod
+
+**Azure DevOps Pipeline**
+```yaml
+trigger:
+  - main
+
+steps:
+  - task: Bash@3
+    inputs:
+      script: |
+        pip install dbt-databricks
+        dbt deps
+        dbt test --target prod
+        dbt run --target prod
+```
+
+## Common Patterns
+
+**Surrogate Keys**
+```sql
+{{ dbt_utils.generate_surrogate_key([
+    'policy_number',
+    'claim_date'
+]) }} as claim_key
+```
+
+**Date Spine**
+```sql
+{{ dbt_utils.date_spine(
+    datepart="day",
+    start_date="cast('2020-01-01' as date)",
+    end_date="cast('2025-12-31' as date)"
+) }}
+```
+
+**Union Tables**
+```sql
+{{ dbt_utils.union_relations(
+    relations=[
+        ref('stg_source_a__claims'),
+        ref('stg_source_b__claims')
+    ]
+) }}
+```
+
+## Best Practices Summary
+
+1. **Modular Design**: One model = one business concept
+2. **Layered Approach**: Staging → Intermediate → Marts
+3. **Test Everything**: Schema tests + custom business logic tests
+4. **Document Early**: Write descriptions as you build
+5. **Version Control**: Git for all dbt project files
+6. **Environment Separation**: Dev, Test, Prod targets
+7. **Incremental When Needed**: Not all models need to be incremental
+8. **Monitor Performance**: Use dbt artifacts and logs
+9. **Collaborate**: Code reviews for all model changes
+10. **Iterate**: Start simple, add complexity as needed
+
+## Insurance Domain Specifics
+
+**Slowly Changing Dimensions**
+- Track underwriter changes over time
+- Historical broker assignments
+- Policy coverage modifications
+- Use dbt snapshots for SCD Type 2
+
+**Regulatory Requirements**
+- Audit trail: Include loaded_at, updated_at
+- Data retention: Implement archival logic
+- PII handling: Mask sensitive fields
+- Lineage: Document data flow for compliance
+
+## Key Takeaways
+
+- dbt brings software engineering best practices to analytics
+- Medallion architecture (Bronze/Silver/Gold) aligns perfectly with dbt layers
+- Testing and documentation are first-class citizens
+- Semantic layer enables consistent metrics across tools
+- Integration with Azure/Databricks creates powerful modern data stack
+- Incremental models dramatically improve performance for large datasets
+

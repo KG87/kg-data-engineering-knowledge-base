@@ -1,0 +1,539 @@
+# Insurance Analytics - Domain-Specific Patterns
+
+## Overview
+Insurance analytics requires specialized knowledge of claims processing, underwriting, and regulatory requirements. Based on experience at Aspen Insurance, Aventum Group, and Big Hand working with Lloyd's market data.
+
+## Core Insurance Concepts
+
+### Insurance Entities
+
+**Policy**
+- Contract between insurer and insured
+- Contains coverage details, limits, deductibles
+- Effective dates (inception, expiry)
+- Premium amounts (gross, net, commission)
+
+**Claim**
+- Request for payment under a policy
+- Contains loss date, claim date, reported date
+- Amounts: incurred, paid, outstanding, reserve
+- Status: Open, Closed, Pending, Declined
+
+**Underwriter**
+- Individual responsible for assessing risk
+- Determines policy terms and pricing
+- Has authority limits
+- Typically organized by line of business
+
+**Broker**
+- Intermediary between client and insurer
+- Receives commission on premiums
+- May represent multiple clients
+- Key relationship management role
+
+**Line of Business (LOB)**
+- Product category (Marine, Property, Casualty, etc.)
+- Different risk profiles and pricing models
+- Regulatory requirements vary by LOB
+- Separate profit/loss tracking
+
+## Key Metrics and KPIs
+
+### Premium Metrics
+
+**Gross Written Premium (GWP)**
+```sql
+SELECT 
+    YEAR(inception_date) as policy_year,
+    line_of_business,
+    SUM(gross_premium) as gwp
+FROM fct_policies
+GROUP BY YEAR(inception_date), line_of_business;
+```
+
+**Net Written Premium (NWP)**
+```sql
+-- GWP minus reinsurance costs
+SELECT 
+    policy_year,
+    SUM(gross_premium - reinsurance_premium) as nwp
+FROM fct_policies
+GROUP BY policy_year;
+```
+
+**Premium Growth Rate**
+```sql
+WITH premium_by_year AS (
+    SELECT 
+        YEAR(inception_date) as policy_year,
+        SUM(gross_premium) as total_premium
+    FROM fct_policies
+    GROUP BY YEAR(inception_date)
+)
+SELECT 
+    current_year.policy_year,
+    current_year.total_premium,
+    prior_year.total_premium as prior_year_premium,
+    ((current_year.total_premium - prior_year.total_premium) 
+        / prior_year.total_premium * 100) as growth_rate_pct
+FROM premium_by_year current_year
+LEFT JOIN premium_by_year prior_year 
+    ON current_year.policy_year = prior_year.policy_year + 1;
+```
+
+### Claims Metrics
+
+**Loss Ratio** (Most Important KPI)
+```sql
+-- Incurred losses / Earned premium (target: 60-70%)
+SELECT 
+    underwriter_key,
+    SUM(incurred_amount) as total_incurred,
+    SUM(earned_premium) as total_earned,
+    (SUM(incurred_amount) / SUM(earned_premium) * 100) as loss_ratio
+FROM fct_claims c
+JOIN fct_policies p ON c.policy_key = p.policy_key
+WHERE YEAR(c.claim_date) = 2024
+GROUP BY underwriter_key
+HAVING SUM(earned_premium) > 0;
+```
+
+**Claims Frequency**
+```sql
+-- Number of claims per 100 policies
+SELECT 
+    line_of_business,
+    COUNT(DISTINCT claim_id) as claim_count,
+    COUNT(DISTINCT policy_number) as policy_count,
+    (COUNT(DISTINCT claim_id) * 100.0 / 
+        COUNT(DISTINCT policy_number)) as frequency_rate
+FROM fct_claims c
+JOIN dim_policies p ON c.policy_key = p.policy_key
+GROUP BY line_of_business;
+```
+
+**Average Claim Severity**
+```sql
+-- Average cost per claim
+SELECT 
+    line_of_business,
+    AVG(incurred_amount) as avg_severity,
+    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY incurred_amount) 
+        as median_severity
+FROM fct_claims c
+JOIN dim_policies p ON c.policy_key = p.policy_key
+WHERE claim_status = 'Closed'
+GROUP BY line_of_business;
+```
+
+**Outstanding Claims Reserve**
+```sql
+-- Total amount reserved for open claims
+SELECT 
+    underwriter_key,
+    SUM(CASE WHEN claim_status = 'Open' 
+            THEN reserve_amount - paid_amount 
+            ELSE 0 END) as outstanding_reserve
+FROM fct_claims
+GROUP BY underwriter_key;
+```
+
+### Combined Ratio
+```sql
+-- Loss Ratio + Expense Ratio (target: < 100%)
+WITH metrics AS (
+    SELECT 
+        line_of_business,
+        SUM(incurred_amount) as total_losses,
+        SUM(earned_premium) as total_earned,
+        SUM(operating_expenses) as total_expenses
+    FROM fct_claims c
+    JOIN fct_policies p ON c.policy_key = p.policy_key
+    GROUP BY line_of_business
+)
+SELECT 
+    line_of_business,
+    (total_losses / total_earned * 100) as loss_ratio,
+    (total_expenses / total_earned * 100) as expense_ratio,
+    ((total_losses + total_expenses) / total_earned * 100) as combined_ratio
+FROM metrics;
+```
+
+## Dimensional Model for Insurance
+
+### Fact Tables
+
+**fct_policies**
+```sql
+CREATE TABLE fct_policies (
+    policy_key BIGINT PRIMARY KEY,
+    policy_number VARCHAR(50),
+    
+    -- Dimension keys
+    underwriter_key BIGINT,
+    broker_key BIGINT,
+    line_of_business_key INT,
+    inception_date_key INT,
+    expiry_date_key INT,
+    
+    -- Premium measures
+    gross_premium DECIMAL(18,2),
+    net_premium DECIMAL(18,2),
+    commission_amount DECIMAL(18,2),
+    reinsurance_premium DECIMAL(18,2),
+    
+    -- Policy attributes
+    policy_limit DECIMAL(18,2),
+    deductible DECIMAL(18,2),
+    
+    -- Audit
+    loaded_at TIMESTAMP
+);
+```
+
+**fct_claims**
+```sql
+CREATE TABLE fct_claims (
+    claim_key BIGINT PRIMARY KEY,
+    claim_id VARCHAR(50),
+    
+    -- Dimension keys
+    policy_key BIGINT,
+    underwriter_key BIGINT,
+    loss_date_key INT,
+    claim_date_key INT,
+    reported_date_key INT,
+    
+    -- Claim measures
+    incurred_amount DECIMAL(18,2),
+    paid_amount DECIMAL(18,2),
+    reserve_amount DECIMAL(18,2),
+    outstanding_amount AS (incurred_amount - paid_amount),
+    
+    -- Claim attributes
+    claim_status VARCHAR(50),
+    claim_type VARCHAR(100),
+    is_large_claim BOOLEAN,
+    
+    -- Time metrics
+    days_to_report INT,
+    days_to_close INT,
+    
+    -- Audit
+    loaded_at TIMESTAMP
+);
+```
+
+### Dimension Tables
+
+**dim_underwriters**
+```sql
+CREATE TABLE dim_underwriters (
+    underwriter_key BIGINT PRIMARY KEY,
+    underwriter_id VARCHAR(50),
+    underwriter_name VARCHAR(200),
+    department VARCHAR(100),
+    region VARCHAR(100),
+    authority_limit DECIMAL(18,2),
+    
+    -- SCD Type 2
+    effective_date DATE,
+    expiry_date DATE,
+    is_current BOOLEAN
+);
+```
+
+**dim_brokers**
+```sql
+CREATE TABLE dim_brokers (
+    broker_key BIGINT PRIMARY KEY,
+    broker_id VARCHAR(50),
+    broker_name VARCHAR(200),
+    broker_type VARCHAR(50),  -- Lloyd's, Direct, Wholesale
+    commission_rate DECIMAL(5,2),
+    
+    -- SCD Type 2
+    effective_date DATE,
+    expiry_date DATE,
+    is_current BOOLEAN
+);
+```
+
+## Advanced Analytics Patterns
+
+### Loss Development Triangle
+
+**Purpose**: Track how claim reserves develop over time
+```sql
+WITH claim_snapshots AS (
+    SELECT 
+        claim_id,
+        accident_year,
+        development_year,
+        incurred_amount
+    FROM fct_claim_development
+),
+triangle AS (
+    SELECT 
+        accident_year,
+        development_year,
+        SUM(incurred_amount) as total_incurred
+    FROM claim_snapshots
+    GROUP BY accident_year, development_year
+)
+SELECT * FROM triangle
+PIVOT (
+    SUM(total_incurred)
+    FOR development_year IN ([1],[2],[3],[4],[5])
+) AS pvt
+ORDER BY accident_year;
+```
+
+### Incurred But Not Reported (IBNR) Reserve
+```sql
+-- Estimate reserves for claims not yet reported
+WITH historical_patterns AS (
+    SELECT 
+        line_of_business,
+        AVG(days_to_report) as avg_reporting_lag,
+        AVG(incurred_amount) as avg_claim_amount
+    FROM fct_claims
+    WHERE claim_status = 'Closed'
+    GROUP BY line_of_business
+),
+exposure AS (
+    SELECT 
+        p.line_of_business,
+        COUNT(*) * h.avg_claim_amount as estimated_ibnr
+    FROM fct_policies p
+    JOIN historical_patterns h 
+        ON p.line_of_business = h.line_of_business
+    WHERE p.expiry_date > CURRENT_DATE - h.avg_reporting_lag
+    GROUP BY p.line_of_business, h.avg_claim_amount
+)
+SELECT * FROM exposure;
+```
+
+### Underwriter Performance Scorecard
+```sql
+WITH underwriter_metrics AS (
+    SELECT 
+        u.underwriter_name,
+        COUNT(DISTINCT p.policy_number) as policy_count,
+        SUM(p.gross_premium) as total_premium,
+        COUNT(DISTINCT c.claim_id) as claim_count,
+        SUM(c.incurred_amount) as total_losses,
+        (SUM(c.incurred_amount) / NULLIF(SUM(p.earned_premium), 0) * 100) 
+            as loss_ratio
+    FROM dim_underwriters u
+    LEFT JOIN fct_policies p ON u.underwriter_key = p.underwriter_key
+    LEFT JOIN fct_claims c ON p.policy_key = c.policy_key
+    WHERE u.is_current = TRUE
+    GROUP BY u.underwriter_name
+)
+SELECT 
+    underwriter_name,
+    policy_count,
+    total_premium,
+    claim_count,
+    total_losses,
+    loss_ratio,
+    CASE 
+        WHEN loss_ratio < 60 THEN 'Excellent'
+        WHEN loss_ratio < 70 THEN 'Good'
+        WHEN loss_ratio < 80 THEN 'Acceptable'
+        ELSE 'Poor'
+    END as performance_rating
+FROM underwriter_metrics
+ORDER BY loss_ratio;
+```
+
+### Large Claim Analysis
+```sql
+-- Identify and track large claims (>$100K)
+WITH large_claims AS (
+    SELECT 
+        c.claim_id,
+        c.incurred_amount,
+        p.policy_number,
+        u.underwriter_name,
+        b.broker_name,
+        p.line_of_business,
+        c.claim_status,
+        DATEDIFF(day, c.claim_date, COALESCE(c.closed_date, CURRENT_DATE)) 
+            as days_open
+    FROM fct_claims c
+    JOIN fct_policies p ON c.policy_key = p.policy_key
+    JOIN dim_underwriters u ON c.underwriter_key = u.underwriter_key
+    JOIN dim_brokers b ON p.broker_key = b.broker_key
+    WHERE c.incurred_amount > 100000
+)
+SELECT 
+    line_of_business,
+    COUNT(*) as large_claim_count,
+    SUM(incurred_amount) as total_large_claim_amount,
+    AVG(days_open) as avg_days_open,
+    SUM(incurred_amount) / SUM(SUM(incurred_amount)) 
+        OVER () * 100 as pct_of_total_losses
+FROM large_claims
+GROUP BY line_of_business
+ORDER BY total_large_claim_amount DESC;
+```
+
+## Real-World Implementation: Aspen Insurance
+
+**Challenge**
+- Claims and policy data scattered across SharePoint lists
+- Manual monthly MI reporting to board
+- No visibility into underwriter performance
+- Unable to identify problematic brokers
+
+**Solution Implemented**
+1. **Bronze Layer**: Automated extraction from SharePoint
+2. **Silver Layer**: Cleaned and joined claims to policies
+3. **Gold Layer**: Dimensional model (fct_claims, fct_policies, dimensions)
+4. **Power BI Dashboard**: Real-time MI with drill-down capabilities
+
+**Dashboards Created**
+- Executive Summary: GWP, Loss Ratio, Combined Ratio by LOB
+- Underwriter Performance: Individual scorecards with trends
+- Claims Analysis: Frequency, Severity, Outstanding reserves
+- Broker Performance: Premium volume, Loss ratios by broker
+
+**Key Metrics Tracked**
+```sql
+-- Monthly MI Dashboard Query
+SELECT 
+    d.year_month,
+    p.line_of_business,
+    SUM(p.gross_premium) as gwp,
+    SUM(c.incurred_amount) as incurred_losses,
+    (SUM(c.incurred_amount) / NULLIF(SUM(p.earned_premium), 0) * 100) 
+        as loss_ratio,
+    COUNT(DISTINCT c.claim_id) as claim_count
+FROM dim_dates d
+LEFT JOIN fct_policies p ON d.date_key = p.inception_date_key
+LEFT JOIN fct_claims c ON p.policy_key = c.policy_key
+WHERE d.year = 2024
+GROUP BY d.year_month, p.line_of_business
+ORDER BY d.year_month, p.line_of_business;
+```
+
+**Impact**
+- Monthly reporting time: 3 days → 1 hour (automated)
+- Board visibility into real-time performance
+- Identified underperforming underwriters (3 with loss ratio > 90%)
+- Enabled data-driven decisions on broker relationships
+
+## Real-World Implementation: Aventum Group
+
+**Lloyd's Market Complexity**
+- Multiple syndicates, brokers, coverholders
+- Complex commission structures
+- Reinsurance arrangements
+
+**Data Model Extensions**
+```sql
+-- Added Lloyd's specific dimensions
+CREATE TABLE dim_syndicates (
+    syndicate_key INT PRIMARY KEY,
+    syndicate_number VARCHAR(10),
+    syndicate_name VARCHAR(200),
+    managing_agent VARCHAR(200)
+);
+
+CREATE TABLE dim_coverholders (
+    coverholder_key INT PRIMARY KEY,
+    coverholder_id VARCHAR(50),
+    coverholder_name VARCHAR(200),
+    territory VARCHAR(100),
+    binding_authority_limit DECIMAL(18,2)
+);
+
+-- Extended fact table
+ALTER TABLE fct_policies ADD syndicate_key INT;
+ALTER TABLE fct_policies ADD coverholder_key INT;
+ALTER TABLE fct_policies ADD reinsurance_treaty_ref VARCHAR(50);
+```
+
+**Advanced Reporting**
+- Premium segmentation by syndicate and LOB
+- Coverholder performance tracking
+- Reinsurance recovery analysis
+- Regulatory reporting (Lloyd's market returns)
+
+## Data Quality Patterns
+
+### Claim Validation Rules
+```sql
+-- Identify data quality issues
+SELECT 
+    claim_id,
+    CASE 
+        WHEN claim_date < loss_date 
+            THEN 'Claim date before loss date'
+        WHEN incurred_amount < paid_amount 
+            THEN 'Paid exceeds incurred'
+        WHEN claim_status = 'Closed' AND outstanding_amount > 0 
+            THEN 'Closed claim with outstanding amount'
+        WHEN loss_date > CURRENT_DATE 
+            THEN 'Future loss date'
+        ELSE 'Valid'
+    END as validation_issue
+FROM fct_claims
+WHERE CASE 
+        WHEN claim_date < loss_date THEN 1
+        WHEN incurred_amount < paid_amount THEN 1
+        WHEN claim_status = 'Closed' AND outstanding_amount > 0 THEN 1
+        WHEN loss_date > CURRENT_DATE THEN 1
+        ELSE 0
+    END = 1;
+```
+
+### Policy Validation
+```sql
+-- Policy data quality checks
+SELECT 
+    policy_number,
+    CASE 
+        WHEN expiry_date <= inception_date 
+            THEN 'Invalid date range'
+        WHEN gross_premium <= 0 
+            THEN 'Invalid premium'
+        WHEN policy_limit < 0 
+            THEN 'Invalid limit'
+        WHEN commission_amount > gross_premium 
+            THEN 'Commission exceeds premium'
+        ELSE 'Valid'
+    END as validation_issue
+FROM fct_policies
+WHERE expiry_date <= inception_date
+   OR gross_premium <= 0
+   OR policy_limit < 0
+   OR commission_amount > gross_premium;
+```
+
+## Best Practices for Insurance Analytics
+
+1. **Always calculate Loss Ratio** - Core profitability metric
+2. **Track development patterns** - Claims develop over time
+3. **Separate accident year from policy year** - Different views needed
+4. **Monitor large claims separately** - Disproportionate impact
+5. **Validate data quality continuously** - Bad data = bad decisions
+6. **Use SCD Type 2 for underwriters/brokers** - Track changes over time
+7. **Pre-calculate common metrics** - Loss ratio, combined ratio
+8. **Maintain audit trail** - Regulatory requirements
+9. **Separate earned vs written premium** - Timing differences matter
+10. **Document business rules** - Complex domain knowledge
+
+## Key Takeaways
+
+- Loss Ratio is the most critical KPI in insurance
+- Claims develop over time - use loss triangles for reserves
+- Dimensional modeling works well for insurance analytics
+- Data quality is critical - implement validation rules
+- SharePoint is common in insurance - extract systematically
+- Lloyd's market adds complexity - extend models accordingly
+- Real-time dashboards enable proactive management
+- Regulatory reporting drives many requirements
+
